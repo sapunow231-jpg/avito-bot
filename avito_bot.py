@@ -1,176 +1,118 @@
-import os
-import logging
-import threading
-import time
-from typing import List, Dict, Set
+import asyncio
 import requests
 from bs4 import BeautifulSoup
-from urllib.parse import quote_plus, urljoin
+from aiogram import Bot, Dispatcher, types
+from aiogram.filters import Command
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-from telegram import Update, ParseMode
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+API_TOKEN = "8385878027:AAEz6A6koSZ3mwvZkvt4xMGvCkIfdvR7FWA"
+BASE_URL = "https://www.avito.ru/samarskaya_oblast"
+HEADERS = {"User-Agent": "Mozilla/5.0"}
 
-# === НАСТРОЙКИ ===
-TELEGRAM_BOT_TOKEN = "8385878027:AAEz6A6koSZ3mwvZkvt4xMGvCkIfdvR7FWA"
-RESULTS_PER_SEARCH = 5
-POLL_INTERVAL_SECONDS = 120
-USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "              "(KHTML, like Gecko) Chrome/117.0.0.0 Safari/537.36"
+bot = Bot(token=API_TOKEN)
+dp = Dispatcher()
 
-subscriptions: Dict[str, Set[int]] = {}
-seen_ads: Dict[str, Set[str]] = {}
+# Хранилище запросов для "отслеживания"
+watchlist = {}  # {user_id: {query: [ссылки_объявлений]}}
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
-def search_avito(query: str, max_results: int = 5) -> List[Dict]:
-    base = "https://www.avito.ru"
-    q = quote_plus(query)
-    url = f"{base}/rossiya?q={q}"
-    headers = {"User-Agent": USER_AGENT}
-    resp = requests.get(url, headers=headers, timeout=15)
-    resp.raise_for_status()
-    soup = BeautifulSoup(resp.text, "lxml")
+def get_avito_results(query: str, limit: int = 5):
+    """Парсит первые limit объявлений по запросу в Самарской области"""
+    url = f"{BASE_URL}?q={query.replace(' ', '+')}"
+    r = requests.get(url, headers=HEADERS)
+    soup = BeautifulSoup(r.text, "html.parser")
 
-    results = []
-    items = soup.select("[data-marker='item']")
-    if not items:
-        items = soup.select(".iva-item-root")
+    items = []
+    for ad in soup.select('div[itemtype="http://schema.org/Product"]')[:limit]:
+        title = ad.select_one("h3")
+        link_tag = ad.select_one("a")
+        price_tag = ad.select_one('meta[itemprop="price"]')
+        img_tag = ad.select_one("img")
 
-    for item in items:
-        if len(results) >= max_results:
-            break
-        try:
-            ad_id = item.get("data-item-id") or item.get("data-marker") or ""
-            title_el = item.select_one("[itemprop='name']") or item.select_one("h3")
-            title = title_el.get_text(strip=True) if title_el else "без заголовка"
-            price_el = item.select_one("[itemprop='price']") or item.select_one(".price")
-            price = price_el.get_text(strip=True) if price_el else "—"
-            a = item.select_one("a")
-            link = urljoin(base, a['href']) if a and a.get('href') else None
-            loc_el = item.select_one(".geo") or item.select_one("[data-marker='item-location']")
-            location = loc_el.get_text(strip=True) if loc_el else ""
-            results.append({
-                "id": ad_id or link or title,
-                "title": title,
-                "price": price,
-                "link": link or url,
-                "location": location,
-            })
-        except Exception as e:
-            logger.exception("Ошибка парсинга объявления: %s", e)
+        if not (title and link_tag):
             continue
-    return results
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Привет! Я ищу объявления на Авито.
-"
-        "Используй /search <запрос> — чтобы найти сейчас.
-"
-        "Используй /subscribe <запрос> — получать новые объявления автоматически.
-"
-        "Используй /unsubscribe <запрос> — убрать подписку.
-"
-        "Используй /list — показать подписки."
+        title_text = title.get_text(strip=True)
+        link = "https://www.avito.ru" + link_tag["href"]
+        price = price_tag["content"] + " ₽" if price_tag else "Цена не указана"
+        img = img_tag["src"] if img_tag else None
+        items.append({"title": title_text, "price": price, "link": link, "img": img})
+    return items
 
-async def search_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = " ".join(context.args)
-    if not query:
-        await update.message.reply_text("Использование: /search <запрос>")
+
+@dp.message(Command("start"))
+async def cmd_start(message: types.Message):
+    await message.answer(
+        "👋 Привет! Я бот для поиска объявлений на Авито (Самарская область).\n"
+        "Отправь мне, что искать, например: `велосипед` или `iPhone 13`.",
+        parse_mode="Markdown"
+    )
+
+
+@dp.message()
+async def handle_query(message: types.Message):
+    query = message.text.strip()
+    results = get_avito_results(query)
+
+    if not results:
+        await message.answer("😔 Ничего не найдено.")
         return
-    await update.message.reply_text(f"Ищу: {query} ...")
-    try:
-        ads = search_avito(query, max_results=RESULTS_PER_SEARCH)
-    except Exception as e:
-        logger.exception("search error")
-        await update.message.reply_text(f"Ошибка при поиске: {e}")
-        return
-    if not ads:
-        await update.message.reply_text("Ничего не нашёл.")
-        return
-    for ad in ads:
-        text = f"*{ad['title']}*
-{ad['price']} — {ad['location']}
-{ad['link']}"
-        await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
-async def subscribe_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    query = " ".join(context.args).strip()
-    if not query:
-        await update.message.reply_text("Использование: /subscribe <запрос>")
-        return
-    subs = subscriptions.setdefault(query.lower(), set())
-    subs.add(chat_id)
-    seen_ads.setdefault(query.lower(), set())
-    await update.message.reply_text(f"Подписал(а) на '{query}'.")
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🔔 Следить за этим запросом", callback_data=f"watch:{query}")
+    builder.adjust(1)
 
-async def unsubscribe_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    query = " ".join(context.args).strip()
-    if not query:
-        await update.message.reply_text("Использование: /unsubscribe <запрос>")
-        return
-    q = query.lower()
-    if q in subscriptions and chat_id in subscriptions[q]:
-        subscriptions[q].remove(chat_id)
-        await update.message.reply_text(f"Отписал(а) от '{query}'.")
-    else:
-        await update.message.reply_text("У вас нет такой подписки.")
+    await message.answer(f"🔎 Результаты по запросу: *{query}*", parse_mode="Markdown")
 
-async def list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    your = [q for q, chats in subscriptions.items() if chat_id in chats]
-    if not your:
-        await update.message.reply_text("У вас нет подписок.")
-    else:
-        await update.message.reply_text("Ваши подписки:
-" + "
-".join(f"- {q}" for q in your))
+    for item in results:
+        caption = f"**{item['title']}**\n{item['price']}\n👉 [Открыть объявление]({item['link']})"
+        if item["img"]:
+            await message.answer_photo(item["img"], caption=caption, parse_mode="Markdown")
+        else:
+            await message.answer(caption, parse_mode="Markdown")
 
-def polling_thread(application):
-    logger.info("Запущен поток проверки подписок. Интервал %s сек", POLL_INTERVAL_SECONDS)
+    await message.answer("Хочешь следить за новыми объявлениями?", reply_markup=builder.as_markup())
+
+
+@dp.callback_query(lambda c: c.data.startswith("watch:"))
+async def watch_query(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    query = callback.data.split(":", 1)[1]
+
+    if user_id not in watchlist:
+        watchlist[user_id] = {}
+    watchlist[user_id][query] = [item["link"] for item in get_avito_results(query, 10)]
+
+    await callback.message.answer(f"✅ Теперь я слежу за запросом: *{query}*", parse_mode="Markdown")
+    await callback.answer()
+
+
+async def watch_loop():
+    """Фоновая задача: проверяет новые объявления каждые 5 минут"""
     while True:
-        try:
-            for query, chats in list(subscriptions.items()):
-                if not chats:
-                    continue
-                try:
-                    ads = search_avito(query, max_results=10)
-                except Exception as e:
-                    logger.exception("Ошибка при запросе для подписки %s: %s", query, e)
-                    continue
-                new = []
-                seen_set = seen_ads.setdefault(query, set())
-                for ad in ads:
-                    if ad["id"] not in seen_set:
-                        new.append(ad)
-                        seen_set.add(ad["id"])
-                if new:
-                    for chat_id in list(chats):
-                        for ad in new:
-                            text = f"🔔 *Новый* — {ad['title']}
-{ad['price']} — {ad['location']}
-{ad['link']}"
-                            try:
-                                application.bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.MARKDOWN)
-                            except Exception as e:
-                                logger.exception("Не удалось отправить сообщение %s", e)
-            time.sleep(POLL_INTERVAL_SECONDS)
-        except Exception:
-            logger.exception("Ошибка в polling_thread")
+        await asyncio.sleep(300)
+        for user_id, queries in watchlist.items():
+            for query, old_links in queries.items():
+                new_ads = get_avito_results(query, 10)
+                new_items = [ad for ad in new_ads if ad["link"] not in old_links]
 
-def main():
-    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("search", search_cmd))
-    app.add_handler(CommandHandler("subscribe", subscribe_cmd))
-    app.add_handler(CommandHandler("unsubscribe", unsubscribe_cmd))
-    app.add_handler(CommandHandler("list", list_cmd))
-    t = threading.Thread(target=polling_thread, args=(app,), daemon=True)
-    t.start()
-    logger.info("Запуск бота...")
-    app.run_polling()
+                if new_items:
+                    text = f"🆕 Новые объявления по запросу *{query}*:"
+                    await bot.send_message(user_id, text, parse_mode="Markdown")
+                    for item in new_items:
+                        caption = f"**{item['title']}**\n{item['price']}\n👉 [Смотреть объявление]({item['link']})"
+                        if item["img"]:
+                            await bot.send_photo(user_id, item["img"], caption=caption, parse_mode="Markdown")
+                        else:
+                            await bot.send_message(user_id, caption, parse_mode="Markdown")
+                    # Обновляем сохранённые ссылки
+                    watchlist[user_id][query] = [ad["link"] for ad in new_ads]
+
+
+async def main():
+    asyncio.create_task(watch_loop())
+    await dp.start_polling(bot)
+
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
