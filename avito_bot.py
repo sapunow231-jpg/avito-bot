@@ -72,7 +72,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Используй /unsubscribe <запрос> — убрать подписку.
 "
         "Используй /list — показать подписки."
-    )
+    
 
 async def search_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = " ".join(context.args)
