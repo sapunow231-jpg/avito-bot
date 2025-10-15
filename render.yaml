@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: avito-telegram-bot
+    env: python
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python bot.py"
+    envVars:
+      - key: TOKEN
+        value: "ВАШ_TELEGRAM_TOKEN"
+      - key: CHAT_ID
+        value: "ВАШ_CHAT_ID"
+      - key: CHECK_INTERVAL
+        value: "2"
+      - key: DEFAULT_CITY
+        value: "samara"
+      - key: DEFAULT_QUERY
+        value: "iphone"
